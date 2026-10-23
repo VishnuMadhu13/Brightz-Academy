@@ -19,7 +19,7 @@ pipeline {
         PROJECT_KEY   = 'brightmindz-academy'
         SONAR_SERVER  = 'sonarqube'
         SCANNER_TOOL  = 'sonar-scanner'
-        TRIVY_VERSION = '0.72.0'
+        TRIVY_VERSION = '0.76.1'
         REPORTS       = 'reports'
         VENV          = "${WORKSPACE}/.venv"
         TRIVY_BIN     = "${WORKSPACE}/bin"
