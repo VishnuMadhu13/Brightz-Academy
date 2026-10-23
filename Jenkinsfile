@@ -178,15 +178,28 @@ pipeline {
             }
         }
 
-        stage('Image Scan (Trivy)') {
+        stage('Trivy FS + Secrets') {
             steps {
                 sh '''
+                    if ! command -v trivy >/dev/null 2>&1; then
+                        mkdir -p ${WORKSPACE}/bin
+                        curl -sSL https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz \
+                            | tar -xz -C ${WORKSPACE}/bin trivy
+                    fi
                     export PATH=${WORKSPACE}/bin:$PATH
-                    for IMG in $(docker compose config --images); do
-                        NAME=$(echo $IMG | tr '/:' '__')
-                        trivy image --severity HIGH,CRITICAL --ignore-unfixed \
-                            --format json --output ${REPORTS}/trivy-image-$NAME.json $IMG || true
-                    done
+
+                    trivy fs --scanners vuln,secret,misconfig \
+                        --skip-dirs node_modules,venv,.venv \
+                        --severity HIGH,CRITICAL \
+                        --format json --output ${REPORTS}/trivy-fs.json .
+
+                    EXIT_CODE=0
+                    if [ "$FAIL_ON_HIGH" = "true" ]; then EXIT_CODE=1; fi
+
+                    trivy fs --scanners vuln,secret,misconfig \
+                        --skip-dirs node_modules,venv,.venv \
+                        --severity HIGH,CRITICAL \
+                        --exit-code $EXIT_CODE .
                 '''
             }
         }
