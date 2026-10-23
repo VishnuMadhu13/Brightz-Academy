@@ -181,12 +181,19 @@ pipeline {
         stage('Trivy FS + Secrets') {
             steps {
                 sh '''
+                    export PATH=${WORKSPACE}/bin:$PATH
                     if ! command -v trivy >/dev/null 2>&1; then
                         mkdir -p ${WORKSPACE}/bin
-                        curl -sSL https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz \
-                            | tar -xz -C ${WORKSPACE}/bin trivy
+                        URL=https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz
+                        if curl -fSL --retry 3 -o /tmp/trivy.tgz "$URL"; then
+                            tar -xzf /tmp/trivy.tgz -C ${WORKSPACE}/bin trivy
+                        else
+                            echo "Direct download failed, trying install script"
+                            curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+                                | sh -s -- -b ${WORKSPACE}/bin v${TRIVY_VERSION}
+                        fi
                     fi
-                    export PATH=${WORKSPACE}/bin:$PATH
+                    trivy --version
 
                     trivy fs --scanners vuln,secret,misconfig \
                         --skip-dirs node_modules,venv,.venv \
@@ -195,7 +202,6 @@ pipeline {
 
                     EXIT_CODE=0
                     if [ "$FAIL_ON_HIGH" = "true" ]; then EXIT_CODE=1; fi
-
                     trivy fs --scanners vuln,secret,misconfig \
                         --skip-dirs node_modules,venv,.venv \
                         --severity HIGH,CRITICAL \
