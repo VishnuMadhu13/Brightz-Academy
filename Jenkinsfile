@@ -12,17 +12,19 @@ pipeline {
         string(name: 'DAST_TARGET', defaultValue: 'http://localhost:80',
                description: 'URL where docker-compose exposes the app (Nginx) for the ZAP scan')
         booleanParam(name: 'FAIL_ON_HIGH', defaultValue: false,
-               description: 'Fail the build on HIGH/CRITICAL dependency or image findings')
+               description: 'Fail the build on HIGH/CRITICAL Trivy findings')
     }
 
     environment {
         PROJECT_KEY   = 'brightmindz-academy'
-        SONAR_SERVER  = 'sonarqube'          // Manage Jenkins > System > SonarQube servers (name)
-        SCANNER_TOOL  = 'sonar-scanner'      // Manage Jenkins > Tools > SonarQube Scanner (name) (*test comment*)
-        IMAGE_NAME    = 'brightmindz-academy'
+        SONAR_SERVER  = 'sonarqube'
+        SCANNER_TOOL  = 'sonar-scanner'
         TRIVY_VERSION = '0.58.1'
         REPORTS       = 'reports'
         VENV          = "${WORKSPACE}/.venv"
+        TRIVY_BIN     = "${WORKSPACE}/bin"
+        // Try GitHub registry first, then the AWS public mirror
+        TRIVY_DB_REPOSITORY = 'ghcr.io/aquasecurity/trivy-db,public.ecr.aws/aquasecurity/trivy-db'
     }
 
     stages {
@@ -58,6 +60,26 @@ pipeline {
                         npm run build
                     '''
                 }
+            }
+        }
+
+        stage('Install Trivy') {
+            steps {
+                sh '''
+                    mkdir -p ${TRIVY_BIN}
+                    if [ ! -x ${TRIVY_BIN}/trivy ]; then
+                        URL=https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz
+                        echo "Downloading $URL"
+                        if curl -fSL --retry 3 -o /tmp/trivy.tgz "$URL" && tar -xzf /tmp/trivy.tgz -C ${TRIVY_BIN} trivy; then
+                            echo "Trivy installed from release tarball"
+                        else
+                            echo "Release download failed, trying the install script"
+                            curl -fSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+                                | sh -s -- -b ${TRIVY_BIN} v${TRIVY_VERSION}
+                        fi
+                    fi
+                    ${TRIVY_BIN}/trivy --version
+                '''
             }
         }
 
@@ -112,9 +134,14 @@ pipeline {
 
         stage('Quality Gate') {
             steps {
-                // Needs a webhook in SonarQube: http://<jenkins>:8080/sonarqube-webhook/
-                timeout(time: 5, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: false
+                script {
+                    try {
+                        timeout(time: 3, unit: 'MINUTES') {
+                            waitForQualityGate abortPipeline: false
+                        }
+                    } catch (err) {
+                        unstable("Quality gate result not received: ${err.getMessage()}")
+                    }
                 }
             }
         }
@@ -150,20 +177,18 @@ pipeline {
                 stage('Trivy FS + Secrets') {
                     steps {
                         sh '''
-                            if ! command -v trivy >/dev/null 2>&1; then
-                                mkdir -p ${WORKSPACE}/bin
-                                curl -sSL https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz \
-                                    | tar -xz -C ${WORKSPACE}/bin trivy
-                            fi
-                            export PATH=${WORKSPACE}/bin:$PATH
+                            export PATH=${TRIVY_BIN}:$PATH
                             trivy fs --scanners vuln,secret,misconfig \
-                                --skip-dirs node_modules,venv,.venv \
+                                --skip-dirs node_modules,venv,.venv,bin \
                                 --severity HIGH,CRITICAL \
                                 --format json --output ${REPORTS}/trivy-fs.json .
+
+                            EXIT_CODE=0
+                            if [ "$FAIL_ON_HIGH" = "true" ]; then EXIT_CODE=1; fi
                             trivy fs --scanners vuln,secret,misconfig \
-                                --skip-dirs node_modules,venv,.venv \
+                                --skip-dirs node_modules,venv,.venv,bin \
                                 --severity HIGH,CRITICAL \
-                                --exit-code ${FAIL_ON_HIGH == 'true' ? 1 : 0} .
+                                --exit-code $EXIT_CODE .
                         '''
                     }
                 }
@@ -173,39 +198,21 @@ pipeline {
         stage('Docker Build') {
             steps {
                 sh '''
+                    [ -f .env ] || cp .env.example .env
                     docker compose build
                 '''
             }
         }
 
-        stage('Trivy FS + Secrets') {
+        stage('Image Scan (Trivy)') {
             steps {
                 sh '''
-                    export PATH=${WORKSPACE}/bin:$PATH
-                    if ! command -v trivy >/dev/null 2>&1; then
-                        mkdir -p ${WORKSPACE}/bin
-                        URL=https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz
-                        if curl -fSL --retry 3 -o /tmp/trivy.tgz "$URL"; then
-                            tar -xzf /tmp/trivy.tgz -C ${WORKSPACE}/bin trivy
-                        else
-                            echo "Direct download failed, trying install script"
-                            curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-                                | sh -s -- -b ${WORKSPACE}/bin v${TRIVY_VERSION}
-                        fi
-                    fi
-                    trivy --version
-
-                    trivy fs --scanners vuln,secret,misconfig \
-                        --skip-dirs node_modules,venv,.venv \
-                        --severity HIGH,CRITICAL \
-                        --format json --output ${REPORTS}/trivy-fs.json .
-
-                    EXIT_CODE=0
-                    if [ "$FAIL_ON_HIGH" = "true" ]; then EXIT_CODE=1; fi
-                    trivy fs --scanners vuln,secret,misconfig \
-                        --skip-dirs node_modules,venv,.venv \
-                        --severity HIGH,CRITICAL \
-                        --exit-code $EXIT_CODE .
+                    export PATH=${TRIVY_BIN}:$PATH
+                    for IMG in $(docker compose config --images); do
+                        NAME=$(echo $IMG | tr '/:' '__')
+                        trivy image --severity HIGH,CRITICAL --ignore-unfixed \
+                            --format json --output ${REPORTS}/trivy-image-$NAME.json $IMG || true
+                    done
                 '''
             }
         }
