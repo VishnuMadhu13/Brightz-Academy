@@ -18,7 +18,7 @@ pipeline {
     environment {
         PROJECT_KEY   = 'brightmindz-academy'
         SONAR_SERVER  = 'sonarqube'          // Manage Jenkins > System > SonarQube servers (name)
-        SCANNER_TOOL  = 'sonar-scanner'      // Manage Jenkins > Tools > SonarQube Scanner (name)
+        SCANNER_TOOL  = 'sonar-scanner'      // Manage Jenkins > Tools > SonarQube Scanner (name) (*test comment*)
         IMAGE_NAME    = 'brightmindz-academy'
         TRIVY_VERSION = '0.58.1'
         REPORTS       = 'reports'
