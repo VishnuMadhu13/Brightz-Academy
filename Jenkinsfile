@@ -32,7 +32,76 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
-                sh 'mkdir -p ${REPORTS}'
+                sh '''
+                    mkdir -p "${REPORTS}"
+                    cat > generate_scan_report.py <<'PYREPORT'
+import html, json, os
+from pathlib import Path
+from datetime import datetime, timezone
+
+reports = Path(os.environ.get("REPORTS", "reports"))
+reports.mkdir(parents=True, exist_ok=True)
+output = reports / "devsecops-scan-report.html"
+scans = {
+    "bandit-report.json": "Bandit — Python SAST",
+    "semgrep-report.json": "Semgrep — SAST",
+    "pip-audit.json": "pip-audit — Python dependencies",
+    "npm-audit.json": "npm audit — frontend dependencies",
+    "trivy-fs.json": "Trivy filesystem scan",
+    "zap-report.json": "OWASP ZAP — DAST",
+}
+for p in sorted(reports.glob("trivy-image-*.json")):
+    scans[p.name] = "Trivy image scan: " + p.name
+
+def walk(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from walk(v)
+
+sections, rows = [], []
+for filename, title in scans.items():
+    path = reports / filename
+    if not path.exists():
+        sections.append("<section><h2>" + html.escape(title) + "</h2><p class='missing'>Report missing; check the Jenkins stage log. Missing does not mean passed.</p></section>")
+        rows.append((title, "Missing", "No report generated"))
+        continue
+    try:
+        data = json.loads(path.read_text(errors="replace"))
+        counts = {s: 0 for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+        for item in walk(data):
+            sev = item.get("Severity", item.get("severity", item.get("risk", "")))
+            if isinstance(sev, str) and sev.upper() in counts:
+                counts[sev.upper()] += 1
+        severity = ", ".join(f"{k}: {v}" for k, v in counts.items() if v) or "No standard severity fields recognized"
+        raw = html.escape(json.dumps(data, indent=2, ensure_ascii=False))
+        sections.append("<section><h2>" + html.escape(title) + "</h2><p><b>Recognized severity counts:</b> " + html.escape(severity) + "</p><details><summary>View complete JSON results</summary><pre>" + raw + "</pre></details></section>")
+        rows.append((title, "Available", severity))
+    except Exception as exc:
+        sections.append("<section><h2>" + html.escape(title) + "</h2><p class='error'>Could not parse JSON: " + html.escape(str(exc)) + "</p></section>")
+        rows.append((title, "Parse error", str(exc)))
+
+for filename, title in (("bandit-report.html", "Bandit HTML detail"), ("pip-audit.md", "pip-audit Markdown detail"), ("zap-report.html", "OWASP ZAP HTML detail")):
+    path = reports / filename
+    if path.exists():
+        sections.append("<section><h2>" + html.escape(title) + "</h2><details><summary>View detail output</summary><pre>" + html.escape(path.read_text(errors="replace")) + "</pre></details></section>")
+
+table = "".join("<tr><td>" + html.escape(n) + "</td><td>" + html.escape(s) + "</td><td>" + html.escape(d) + "</td></tr>" for n, s, d in rows)
+stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+css = "body{font:15px/1.5 system-ui,sans-serif;margin:0;background:#f4f6f8;color:#17202a}header{background:#14243a;color:white;padding:26px}main{max-width:1100px;margin:24px auto;padding:0 18px}section,.summary{background:white;border:1px solid #dce2e8;border-radius:10px;padding:18px;margin:16px 0;overflow-wrap:anywhere}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #e3e7eb;padding:9px;text-align:left;vertical-align:top}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:650px;overflow:auto;background:#f6f8fa;padding:14px;border-radius:6px;font-size:12px}summary{cursor:pointer;font-weight:600}.missing,.error{color:#a12622}"
+document = ("<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Consolidated DevSecOps Scan Report</title><style>" + css + "</style></head><body>"
+    "<header><h1>Consolidated DevSecOps Scan Report</h1><div>Project: Bright Mindz Academy</div><div>Generated: " + stamp + "</div></header><main>"
+    "<div class='summary'><h2>Scan summary</h2><p>All available scan JSON outputs are included below. Missing outputs are marked and must not be interpreted as passing scans.</p>"
+    "<table><thead><tr><th>Scanner</th><th>Status</th><th>Recognized severity summary</th></tr></thead><tbody>" + table + "</tbody></table></div>"
+    + "".join(sections) + "</main></body></html>")
+output.write_text(document)
+print("Generated " + str(output))
+PYREPORT
+                '''
             }
         }
 
@@ -280,14 +349,25 @@ pipeline {
                 }
             }
         }
+
+        stage('Generate Consolidated Scan Report') {
+            steps {
+                sh 'REPORTS="${REPORTS}" python3 generate_scan_report.py && test -s "${REPORTS}/devsecops-scan-report.html"'
+            }
+        }
     }
 
     post {
         always {
-            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+            sh '''
+                if [ -f generate_scan_report.py ]; then
+                    REPORTS="${REPORTS}" python3 generate_scan_report.py || echo "WARNING: consolidated report generation failed"
+                fi
+            '''
+            archiveArtifacts artifacts: 'reports/devsecops-scan-report.html', allowEmptyArchive: true, fingerprint: true
             publishHTML(target: [
-                reportDir: 'reports', reportFiles: 'bandit-report.html,zap-report.html',
-                reportName: 'Security Reports', allowMissing: true,
+                reportDir: 'reports', reportFiles: 'devsecops-scan-report.html',
+                reportName: 'Consolidated DevSecOps Scan Report', allowMissing: true,
                 keepAll: true, alwaysLinkToLastBuild: true
             ])
         }
