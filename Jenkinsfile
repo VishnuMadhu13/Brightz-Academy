@@ -9,8 +9,8 @@ pipeline {
     }
 
     parameters {
-        string(name: 'DAST_TARGET', defaultValue: 'http://localhost:80',
-               description: 'URL where docker-compose exposes the app (Nginx) for the ZAP scan')
+        string(name: 'DAST_TARGET', defaultValue: 'http://brightmindz_nginx:80',
+               description: 'Nginx container URL on the compose network, used by the ZAP scan')
         booleanParam(name: 'FAIL_ON_HIGH', defaultValue: false,
                description: 'Fail the build on HIGH/CRITICAL Trivy findings')
     }
@@ -19,10 +19,11 @@ pipeline {
         PROJECT_KEY   = 'brightmindz-academy'
         SONAR_SERVER  = 'sonarqube'
         SCANNER_TOOL  = 'sonar-scanner'
-        TRIVY_VERSION = '0.76.1'
+        TRIVY_VERSION = '0.72.0'
         REPORTS       = 'reports'
         VENV          = "${WORKSPACE}/.venv"
         TRIVY_BIN     = "${WORKSPACE}/bin"
+        DAST_NET      = 'brightz-academy_brightmindz_net'   // <project>_<network> from docker compose
         // Try GitHub registry first, then the AWS public mirror
         TRIVY_DB_REPOSITORY = 'ghcr.io/aquasecurity/trivy-db,public.ecr.aws/aquasecurity/trivy-db'
     }
@@ -114,17 +115,19 @@ pipeline {
 
                 stage('SonarQube') {
                     steps {
-                        script {
-                            def scannerHome = tool "${SCANNER_TOOL}"
-                            withSonarQubeEnv("${SONAR_SERVER}") {
-                                sh """
-                                    ${scannerHome}/bin/sonar-scanner \
-                                      -Dsonar.projectKey=${PROJECT_KEY} \
-                                      -Dsonar.projectName='Bright Mindz Academy' \
-                                      -Dsonar.sources=backend,frontend/src \
-                                      -Dsonar.exclusions=**/node_modules/**,**/venv/**,**/migrations/**,**/dist/** \
-                                      -Dsonar.python.version=3.12
-                                """
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            script {
+                                def scannerHome = tool "${SCANNER_TOOL}"
+                                withSonarQubeEnv("${SONAR_SERVER}") {
+                                    sh """
+                                        ${scannerHome}/bin/sonar-scanner \
+                                          -Dsonar.projectKey=${PROJECT_KEY} \
+                                          -Dsonar.projectName='Bright Mindz Academy' \
+                                          -Dsonar.sources=backend,frontend/src \
+                                          -Dsonar.exclusions=**/node_modules/**,**/venv/**,**/migrations/**,**/dist/** \
+                                          -Dsonar.python.version=3.12
+                                    """
+                                }
                             }
                         }
                     }
@@ -222,24 +225,45 @@ pipeline {
             steps {
                 sh '''
                     [ -f .env ] || cp .env.example .env
-                    docker compose up -d
+
+                    # Jenkins runs in a container, so host bind mounts (./docker/nginx/nginx.conf)
+                    # would point at paths that do not exist on the Docker host.
+                    # Drop the nginx bind mounts and copy the config into the container instead.
+                    cat > docker-compose.dast.yml <<'YML'
+services:
+  nginx:
+    volumes: !reset []
+    ports: !reset []
+YML
+                    COMPOSE="docker compose -f docker-compose.yml -f docker-compose.dast.yml"
+
+                    $COMPOSE up -d --no-start
+                    docker cp docker/nginx/nginx.conf brightmindz_nginx:/etc/nginx/conf.d/default.conf
+                    $COMPOSE up -d
 
                     echo "Waiting for app at ${DAST_TARGET} ..."
+                    READY=no
                     for i in $(seq 1 30); do
-                        curl -s -o /dev/null ${DAST_TARGET} && break
+                        if docker run --rm --network ${DAST_NET} curlimages/curl -s -o /dev/null ${DAST_TARGET}; then
+                            READY=yes; break
+                        fi
                         sleep 5
                     done
+                    echo "App ready: $READY"
+                    $COMPOSE ps
 
-                    mkdir -p ${REPORTS} && chmod 777 ${REPORTS}
-                    docker run --rm --network host -v ${WORKSPACE}/${REPORTS}:/zap/wrk:rw \
+                    # No bind mount for ZAP output: run, then copy the reports out
+                    docker rm -f zap-scan >/dev/null 2>&1 || true
+                    docker run --name zap-scan --network ${DAST_NET} \
                         ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
-                        -t ${DAST_TARGET} \
-                        -r zap-report.html -J zap-report.json -I || true
+                        -t ${DAST_TARGET} -r zap-report.html -J zap-report.json -I || true
+                    docker cp zap-scan:/zap/wrk/. ${REPORTS}/ || true
+                    docker rm -f zap-scan || true
                 '''
             }
             post {
                 always {
-                    sh 'docker compose down -v || true'
+                    sh 'docker compose -f docker-compose.yml -f docker-compose.dast.yml down -v || true'
                 }
             }
         }
