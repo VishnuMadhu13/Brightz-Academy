@@ -1,4 +1,3 @@
-cat > backend/entrypoint.sh << 'EOF'
 #!/bin/sh
 set -e
 
@@ -9,4 +8,3 @@ echo "Collecting static files..."
 python manage.py collectstatic --noinput
 
 exec "$@"
-EOF
