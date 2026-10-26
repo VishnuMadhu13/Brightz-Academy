@@ -9,8 +9,6 @@ pipeline {
     }
 
     parameters {
-        string(name: 'DAST_TARGET', defaultValue: 'http://brightmindz_nginx:80',
-               description: 'Nginx container URL on the compose network, used by the ZAP scan')
         booleanParam(name: 'FAIL_ON_HIGH', defaultValue: false,
                description: 'Fail the build on HIGH/CRITICAL Trivy findings')
     }
@@ -24,6 +22,7 @@ pipeline {
         VENV          = "${WORKSPACE}/.venv"
         TRIVY_BIN     = "${WORKSPACE}/bin"
         DAST_NET      = 'brightz-academy_brightmindz_net'   // <project>_<network> from docker compose
+        DAST_URL      = 'http://brightmindz_frontend:80'    // container name on the compose network
         // Try GitHub registry first, then the AWS public mirror
         TRIVY_DB_REPOSITORY = 'ghcr.io/aquasecurity/trivy-db,public.ecr.aws/aquasecurity/trivy-db'
     }
@@ -223,47 +222,51 @@ pipeline {
         // ----------------------------- DAST ----------------------------
         stage('DAST (OWASP ZAP)') {
             steps {
-                sh '''
-                    [ -f .env ] || cp .env.example .env
+                // A failed DAST marks the build UNSTABLE but never blocks the report archiving
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    sh '''
+                        [ -f .env ] || cp .env.example .env
 
-                    # Jenkins runs in a container, so host bind mounts (./docker/nginx/nginx.conf)
-                    # would point at paths that do not exist on the Docker host.
-                    # Drop the nginx bind mounts and copy the config into the container instead.
-                    cat > docker-compose.dast.yml <<'YML'
-services:
-  nginx:
-    volumes: !reset []
-    ports: !reset []
-YML
-                    COMPOSE="docker compose -f docker-compose.yml -f docker-compose.dast.yml"
+                        # Start db + backend + frontend. The frontend image has its own nginx and
+                        # config baked in, so no host bind mounts are needed (Jenkins runs in a
+                        # container, so bind-mount paths would not exist on the Docker host).
+                        docker compose up -d db backend frontend
 
-                    $COMPOSE up -d --no-start
-                    docker cp docker/nginx/nginx.conf brightmindz_nginx:/etc/nginx/conf.d/default.conf
-                    $COMPOSE up -d
+                        echo "Waiting for app at ${DAST_URL} ..."
+                        READY=no
+                        for i in $(seq 1 24); do
+                            CODE=$(docker run --rm --network ${DAST_NET} curlimages/curl -s -o /dev/null -w '%{http_code}' ${DAST_URL} || true)
+                            echo "attempt $i: HTTP $CODE"
+                            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then READY=yes; break; fi
+                            sleep 5
+                        done
+                        docker compose ps
 
-                    echo "Waiting for app at ${DAST_TARGET} ..."
-                    READY=no
-                    for i in $(seq 1 30); do
-                        if docker run --rm --network ${DAST_NET} curlimages/curl -s -o /dev/null ${DAST_TARGET}; then
-                            READY=yes; break
+                        if [ "$READY" != "yes" ]; then
+                            echo "App did not come up. Container logs follow:"
+                            for C in brightmindz_backend brightmindz_frontend brightmindz_db; do
+                                echo "=================== $C ==================="
+                                docker logs --tail 80 $C 2>&1 || true
+                            done
+                            exit 1
                         fi
-                        sleep 5
-                    done
-                    echo "App ready: $READY"
-                    $COMPOSE ps
 
-                    # No bind mount for ZAP output: run, then copy the reports out
-                    docker rm -f zap-scan >/dev/null 2>&1 || true
-                    docker run --name zap-scan --network ${DAST_NET} \
-                        ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
-                        -t ${DAST_TARGET} -r zap-report.html -J zap-report.json -I || true
-                    docker cp zap-scan:/zap/wrk/. ${REPORTS}/ || true
-                    docker rm -f zap-scan || true
-                '''
+                        # ZAP needs /zap/wrk mounted: use a named volume (no host path), then copy reports out
+                        docker rm -f zap-scan >/dev/null 2>&1 || true
+                        docker volume rm -f zap-wrk >/dev/null 2>&1 || true
+                        docker volume create zap-wrk
+                        docker run --name zap-scan --network ${DAST_NET} -v zap-wrk:/zap/wrk \
+                            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+                            -t ${DAST_URL} -r zap-report.html -J zap-report.json -I || true
+                        docker cp zap-scan:/zap/wrk/. ${REPORTS}/ || true
+                        docker rm -f zap-scan || true
+                        docker volume rm -f zap-wrk || true
+                    '''
+                }
             }
             post {
                 always {
-                    sh 'docker compose -f docker-compose.yml -f docker-compose.dast.yml down -v || true'
+                    sh 'docker compose down -v || true'
                 }
             }
         }
