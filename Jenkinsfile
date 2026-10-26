@@ -46,7 +46,7 @@ pipeline {
                         pip install -r requirements.txt
                         [ -f ../.env ] || cp ../.env.example ../.env
                         python manage.py check
-                        python manage.py test --noinput || true
+                        python manage.py test --noinput
                     '''
                 }
             }
