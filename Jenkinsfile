@@ -242,6 +242,9 @@ pipeline {
                         done
                         docker compose ps
 
+                        echo "=================== backend logs (last 80 lines) ==================="
+                        docker logs --tail 80 brightmindz_backend 2>&1 || true
+
                         if [ "$READY" != "yes" ]; then
                             echo "App did not come up. Container logs follow:"
                             for C in brightmindz_backend brightmindz_frontend brightmindz_db; do
@@ -255,12 +258,19 @@ pipeline {
                         docker rm -f zap-scan >/dev/null 2>&1 || true
                         docker volume rm -f zap-wrk >/dev/null 2>&1 || true
                         docker volume create zap-wrk
+                        docker run --rm -v zap-wrk:/zap/wrk alpine chmod 777 /zap/wrk
                         docker run --name zap-scan --network ${DAST_NET} -v zap-wrk:/zap/wrk \
                             ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
                             -t ${DAST_URL} -r zap-report.html -J zap-report.json -I || true
                         docker cp zap-scan:/zap/wrk/. ${REPORTS}/ || true
                         docker rm -f zap-scan || true
                         docker volume rm -f zap-wrk || true
+
+                        STATE=$(docker inspect -f '{{.State.Status}}' brightmindz_backend 2>/dev/null || echo missing)
+                        if [ "$STATE" != "running" ]; then
+                            echo "WARNING: backend is '$STATE' - only the frontend was scanned, the API was not tested"
+                            exit 1
+                        fi
                     '''
                 }
             }
